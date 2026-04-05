@@ -14,15 +14,14 @@ func main() {
 		listenAddr = flag.String("listen", ":8080", "address to listen on")
 		upstream   = flag.String("upstream", "https://github.com", "upstream Git server URL")
 		authType   = flag.String("auth-type", "basic", "authentication type: basic or bearer")
-		token      = flag.String("token", "", "authentication token (PAT or OAuth token)")
 		username   = flag.String("username", "", "username for basic auth (default: x-access-token)")
 		timeout    = flag.Duration("approval-timeout", 5*60*1e9, "timeout for push approval")
 	)
 	flag.Parse()
 
-	if *token == "" {
-		fmt.Fprintln(os.Stderr, "error: -token is required")
-		flag.Usage()
+	token := os.Getenv("GITPROXY_TOKEN")
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "error: GITPROXY_TOKEN environment variable is required")
 		os.Exit(1)
 	}
 
@@ -38,7 +37,7 @@ func main() {
 	cfg := ProxyConfig{
 		Upstream:        upstreamURL,
 		AuthType:        *authType,
-		Token:           *token,
+		Token:           token,
 		Username:        *username,
 		ApprovalTimeout: *timeout,
 	}
