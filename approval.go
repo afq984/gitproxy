@@ -56,12 +56,17 @@ type CLIApprover struct {
 	once     sync.Once
 	mu       sync.Mutex    // serializes Approve calls
 	activeCh atomic.Value  // holds chan string for the current prompt
+	Reader   io.Reader     // input source; defaults to os.Stdin if nil
 }
 
 func (a *CLIApprover) init() {
 	a.once.Do(func() {
+		r := a.Reader
+		if r == nil {
+			r = os.Stdin
+		}
 		go func() {
-			scanner := bufio.NewScanner(os.Stdin)
+			scanner := bufio.NewScanner(r)
 			for scanner.Scan() {
 				ch, ok := a.activeCh.Load().(chan string)
 				if !ok {
