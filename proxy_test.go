@@ -528,3 +528,130 @@ func TestMultipleRefUpdateRejected(t *testing.T) {
 		t.Errorf("expected single ref update error, got: %s", body)
 	}
 }
+
+func TestNonGitEndpointReturns403(t *testing.T) {
+	env := newTestEnv(t, &testApprover{approve: true})
+
+	paths := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/api/v3/repos/owner/repo"},
+		{"POST", "/api/v3/repos/owner/repo/issues"},
+		{"DELETE", "/api/v3/repos/owner/repo/branches/main"},
+		{"GET", "/settings"},
+		{"POST", "/repo/info/refs?service=git-receive-pack"},
+	}
+
+	for _, tt := range paths {
+		req, _ := http.NewRequest(tt.method, env.proxy.URL+tt.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: request failed: %v", tt.method, tt.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s: got status %d, want 403", tt.method, tt.path, resp.StatusCode)
+		}
+	}
+
+	// Also verify that the upstream never received any of these requests
+	// (i.e., no credential leakage to non-git paths).
+	var upstreamHit bool
+	origHandler := env.upstream.Config.Handler
+	env.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		origHandler.ServeHTTP(w, r)
+	})
+
+	req, _ := http.NewRequest("GET", env.proxy.URL+"/api/v3/user", nil)
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if upstreamHit {
+		t.Error("non-git request was forwarded to upstream")
+	}
+}
+
+func TestCredentialInjectionBearer(t *testing.T) {
+	env := newTestEnv(t, &testApprover{approve: true})
+
+	// Recreate proxy with bearer auth.
+	env.proxy.Close()
+	upstreamURL, _ := url.Parse(env.upstream.URL)
+	cfg := ProxyConfig{
+		Upstream:        upstreamURL,
+		AuthType:        "bearer",
+		Token:           "ghp_testtoken123",
+		Username:        "ignored",
+		ApprovalTimeout: 5 * time.Second,
+	}
+	proxy := NewProxy(cfg, &testApprover{approve: true})
+	proxySrv := httptest.NewServer(proxy)
+	t.Cleanup(proxySrv.Close)
+	proxyURL := proxySrv.URL + "/" + filepath.Base(env.bareRepo)
+
+	var receivedAuth string
+	origHandler := env.upstream.Config.Handler
+	env.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		origHandler.ServeHTTP(w, r)
+	})
+
+	cloneDir := t.TempDir()
+	run(t, cloneDir, "git", "clone", proxyURL, cloneDir)
+
+	if receivedAuth == "" {
+		t.Fatal("upstream did not receive Authorization header")
+	}
+	if receivedAuth != "Bearer ghp_testtoken123" {
+		t.Errorf("expected 'Bearer ghp_testtoken123', got: %s", receivedAuth)
+	}
+}
+
+func TestCLIApproverStaleInputAfterTimeout(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	defer pw.Close()
+
+	approver := &CLIApprover{Reader: pr}
+	update := RefUpdate{
+		OldOID: strings.Repeat("0", 40),
+		NewOID: strings.Repeat("a", 40),
+		Ref:    "refs/heads/main",
+	}
+
+	// First approval: times out quickly.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel1()
+	_, err = approver.Approve(ctx1, update)
+	if err == nil {
+		t.Fatal("first approval should have timed out")
+	}
+
+	// Simulate stale input arriving after timeout.
+	// Write "y" — this should be consumed by the old (abandoned) channel.
+	fmt.Fprintln(pw, "y")
+
+	// Give the scanner goroutine time to consume the stale line.
+	time.Sleep(50 * time.Millisecond)
+
+	// Second approval: should get fresh input, not the stale "y".
+	// Write "n" — this should go to the new channel.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		fmt.Fprintln(pw, "n")
+	}()
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	approved, err := approver.Approve(ctx2, update)
+	if err != nil {
+		t.Fatalf("second approval should not error: %v", err)
+	}
+	if approved {
+		t.Error("second approval should be denied (got stale 'y' instead of fresh 'n')")
+	}
+}
