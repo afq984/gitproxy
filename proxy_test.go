@@ -29,14 +29,18 @@ func TestMain(m *testing.M) {
 
 // testApprover is an Approver for tests that returns a preconfigured result.
 type testApprover struct {
-	approve bool
-	delay   time.Duration
-	called  chan RefUpdate
+	approve      bool
+	delay        time.Duration
+	called       chan RefUpdate
+	pairCodeChan chan string
 }
 
-func (a *testApprover) Approve(ctx context.Context, update RefUpdate) (bool, error) {
+func (a *testApprover) Approve(ctx context.Context, update RefUpdate, pairCode string) (bool, error) {
 	if a.called != nil {
 		a.called <- update
+	}
+	if a.pairCodeChan != nil {
+		a.pairCodeChan <- pairCode
 	}
 	if a.delay > 0 {
 		select {
@@ -339,6 +343,40 @@ func TestPushNewBranch(t *testing.T) {
 	}
 }
 
+func TestPushPairingCode(t *testing.T) {
+	pairCodeChan := make(chan string, 1)
+	env := newTestEnv(t, &testApprover{approve: true, pairCodeChan: pairCodeChan})
+
+	cloneDir := t.TempDir()
+	run(t, cloneDir, "git", "clone", env.proxyURL, cloneDir)
+	run(t, cloneDir, "git", "config", "user.email", "test@test.com")
+	run(t, cloneDir, "git", "config", "user.name", "Test")
+	writeFile(t, filepath.Join(cloneDir, "pairtest"), "data\n")
+	run(t, cloneDir, "git", "add", "pairtest")
+	run(t, cloneDir, "git", "commit", "-m", "test pairing code")
+
+	// Capture stderr from git push to check for the pairing code.
+	out, err := runGit(t, cloneDir, "push", "origin", "main")
+	if err != nil {
+		t.Fatalf("push failed: %v\n%s", err, out)
+	}
+
+	// The pairing code should appear as "remote: Pairing code: XXX-1234".
+	if !strings.Contains(out, "Pairing code:") {
+		t.Errorf("git push output should contain pairing code, got:\n%s", out)
+	}
+
+	// Verify the same code was passed to the approver.
+	select {
+	case code := <-pairCodeChan:
+		if !strings.Contains(out, code) {
+			t.Errorf("pairing code mismatch: approver got %q but git output was:\n%s", code, out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pairing code was not passed to approver")
+	}
+}
+
 func TestUpstreamURLPathTraversal(t *testing.T) {
 	upstream, _ := url.Parse("https://host/base")
 	cfg := ProxyConfig{
@@ -626,7 +664,7 @@ func TestCLIApproverStaleInputAfterTimeout(t *testing.T) {
 	// First approval: times out quickly.
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel1()
-	_, err = approver.Approve(ctx1, update)
+	_, err = approver.Approve(ctx1, update, "TEST-0001")
 	if err == nil {
 		t.Fatal("first approval should have timed out")
 	}
@@ -647,7 +685,7 @@ func TestCLIApproverStaleInputAfterTimeout(t *testing.T) {
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
-	approved, err := approver.Approve(ctx2, update)
+	approved, err := approver.Approve(ctx2, update, "TEST-0002")
 	if err != nil {
 		t.Fatalf("second approval should not error: %v", err)
 	}

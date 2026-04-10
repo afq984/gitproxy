@@ -44,8 +44,10 @@ func (pr *pushRequest) body() io.Reader {
 }
 
 // Approver decides whether a push should be allowed.
+// The pairCode is a short identifier displayed to both the git client
+// and the reviewer so they can verify the prompt matches the push.
 type Approver interface {
-	Approve(ctx context.Context, update RefUpdate) (bool, error)
+	Approve(ctx context.Context, update RefUpdate, pairCode string) (bool, error)
 }
 
 // CLIApprover prompts on stdin/stdout for approval.
@@ -82,7 +84,7 @@ func (a *CLIApprover) init() {
 	})
 }
 
-func (a *CLIApprover) Approve(ctx context.Context, update RefUpdate) (bool, error) {
+func (a *CLIApprover) Approve(ctx context.Context, update RefUpdate, pairCode string) (bool, error) {
 	a.init()
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -95,9 +97,10 @@ func (a *CLIApprover) Approve(ctx context.Context, update RefUpdate) (bool, erro
 
 	fmt.Println()
 	fmt.Println("=== Push approval required ===")
-	fmt.Printf("  Ref:     %s\n", update.Ref)
-	fmt.Printf("  New OID: %s\n", update.NewOID)
-	fmt.Printf("  Old OID: %s\n", update.OldOID)
+	fmt.Printf("  Pairing code: %s\n", pairCode)
+	fmt.Printf("  Ref:          %s\n", update.Ref)
+	fmt.Printf("  New OID:      %s\n", update.NewOID)
+	fmt.Printf("  Old OID:      %s\n", update.OldOID)
 	fmt.Print("Approve? [y/N] ")
 
 	select {
@@ -248,6 +251,32 @@ func spoolPushBody(push *pushRequest) (*os.File, error) {
 	return f, nil
 }
 
+// writeSidebandProgress writes a sideband channel-2 (progress) pkt-line.
+// These appear as "remote: <msg>" in the git client's stderr.
+func writeSidebandProgress(w io.Writer, msg string) {
+	data := append([]byte{2}, []byte(msg)...)
+	fmt.Fprintf(w, "%04x", len(data)+4)
+	w.Write(data)
+}
+
+// writeSidebandReportStatus writes a report-status error response wrapped in
+// sideband channel 1, followed by a flush packet. Unlike writeReportStatus,
+// this writes only the body (no HTTP headers) — for use when the response has
+// already been started.
+func writeSidebandReportStatus(w io.Writer, ref, msg string) {
+	var rs bytes.Buffer
+	writePktLineStr(&rs, fmt.Sprintf("unpack %s\n", msg))
+	if ref != "" {
+		writePktLineStr(&rs, fmt.Sprintf("ng %s %s\n", ref, msg))
+	}
+	rs.WriteString("0000")
+
+	data := append([]byte{1}, rs.Bytes()...)
+	fmt.Fprintf(w, "%04x", len(data)+4)
+	w.Write(data)
+	w.Write([]byte("0000")) // flush
+}
+
 // handleWrite intercepts a git-receive-pack POST, parses the ref updates,
 // requests approval, and either forwards or denies the push.
 func (p *Proxy) handleWrite(w http.ResponseWriter, r *http.Request) {
@@ -295,35 +324,67 @@ func (p *Proxy) handleWrite(w http.ResponseWriter, r *http.Request) {
 	defer os.Remove(spool.Name())
 	defer spool.Close()
 
+	// Generate a pairing code so the reviewer can verify they are
+	// approving the same push the git client is waiting on.
+	pairCode := generatePairCode()
+	log.Printf("pairing code for %s: %s", update.Ref, pairCode)
+
+	// If the client supports sideband, start the HTTP response early
+	// and send the pairing code as a progress message. The client
+	// displays these as "remote: ..." lines.
+	responseStarted := false
+	if sideband {
+		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+		w.WriteHeader(http.StatusOK)
+		responseStarted = true
+		writeSidebandProgress(w, fmt.Sprintf("Pairing code: %s\n", pairCode))
+		writeSidebandProgress(w, "Waiting for push approval...\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
+	// sendError writes a report-status error to the client. When the
+	// response has already been started (sideband pairing code sent),
+	// it writes only the sideband body; otherwise it writes a full
+	// HTTP response.
+	sendError := func(ref, msg string) {
+		if responseStarted {
+			writeSidebandReportStatus(w, ref, msg)
+		} else {
+			writeReportStatus(w, ref, msg, false)
+		}
+	}
+
 	// Request approval with timeout.
 	ctx, cancel := context.WithTimeout(r.Context(), p.config.ApprovalTimeout)
 	defer cancel()
 
-	approved, err := p.approver.Approve(ctx, update)
+	approved, err := p.approver.Approve(ctx, update, pairCode)
 	if err != nil {
 		if ctx.Err() != nil {
-			log.Printf("approval timed out for %s", update.Ref)
-			writeReportStatus(w, update.Ref, "proxy: approval timed out", sideband)
+			log.Printf("approval timed out for %s [%s]", update.Ref, pairCode)
+			sendError(update.Ref, "proxy: approval timed out")
 			return
 		}
 		log.Printf("approval error: %v", err)
-		writeReportStatus(w, update.Ref, "proxy: approval error", sideband)
+		sendError(update.Ref, "proxy: approval error")
 		return
 	}
 
 	if !approved {
-		log.Printf("push denied for %s", update.Ref)
-		writeReportStatus(w, update.Ref, "proxy: push denied by reviewer", sideband)
+		log.Printf("push denied for %s [%s]", update.Ref, pairCode)
+		sendError(update.Ref, "proxy: push denied by reviewer")
 		return
 	}
 
-	log.Printf("push approved for %s -> %s", update.NewOID, update.Ref)
+	log.Printf("push approved for %s -> %s [%s]", update.NewOID, update.Ref, pairCode)
 
 	// Forward the spooled body to upstream.
 	resp, err := p.forwardBody(r, spool)
 	if err != nil {
 		log.Printf("upstream error after approval: %v", err)
-		writeReportStatus(w, update.Ref, "proxy: upstream connection failed after approval (ambiguous state - verify manually)", sideband)
+		sendError(update.Ref, "proxy: upstream connection failed after approval (ambiguous state - verify manually)")
 		return
 	}
 	defer resp.Body.Close()
@@ -332,24 +393,36 @@ func (p *Proxy) handleWrite(w http.ResponseWriter, r *http.Request) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("error reading upstream response: %v", err)
-		writeReportStatus(w, update.Ref, "proxy: failed to read upstream response (ambiguous state - verify manually)", sideband)
+		sendError(update.Ref, "proxy: failed to read upstream response (ambiguous state - verify manually)")
 		return
 	}
 
-	// Relay the response to the client.
-	for k, vals := range resp.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
+	// If the upstream returned an HTTP-level error (e.g. 401, 500),
+	// the body is likely not valid Git protocol. Send a proper
+	// report-status error so the client gets a meaningful message.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("upstream HTTP error (status %d) for %s [%s]; approval token not consumed", resp.StatusCode, update.Ref, pairCode)
+		sendError(update.Ref, fmt.Sprintf("proxy: upstream rejected push (HTTP %d)", resp.StatusCode))
+		return
 	}
-	w.WriteHeader(resp.StatusCode)
+
+	// Relay the response to the client. If we already started the
+	// response (sideband pairing code), only write the body.
+	if !responseStarted {
+		for k, vals := range resp.Header {
+			for _, v := range vals {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+	}
 	w.Write(respBody)
 
 	// Log outcome based on response.
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 && strings.Contains(string(respBody), "unpack ok") {
-		log.Printf("push succeeded upstream for %s -> %s", update.NewOID, update.Ref)
+	if strings.Contains(string(respBody), "unpack ok") {
+		log.Printf("push succeeded upstream for %s -> %s [%s]", update.NewOID, update.Ref, pairCode)
 	} else {
-		log.Printf("push rejected upstream (status %d) for %s; approval token not consumed", resp.StatusCode, update.Ref)
+		log.Printf("push rejected upstream for %s [%s]; approval token not consumed", update.Ref, pairCode)
 	}
 }
 
